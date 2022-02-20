@@ -1,0 +1,866 @@
+---
+title: "Understanding the demand drivers for best and worst performing Rossmann stores and forecasting their daily demand"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+<br>
+**Ekta Aggarwal**
+<br/>
+
+## 1. Introduction
+
+Every store has its own distinct features such as its store model, the assortment structure applied, proximity to the competitors and different times when promotions are carried out. It is crucial for a business to understand which  of its stores are the top performers and which are lagging to make better decisions to optimise the sales.
+
+This case study deals with assessing the impact of various promotions, assortment structure, store types, holidays on top and worst performing 25 stores for Rossmann, a major European retailer. For this, we have utilised multiple linear regression to understand the effect of these factors on sales. Additionally, we have tried to find the reasons for substantial difference in the sales and footfall in the top and laggard stores.
+
+Moreover, we have compared the 2 methods: multiple linear regression and neural networks to understand which of them can better predict the sales in these top and laggard stores.
+
+```{r include=FALSE}
+#Loading the libraries
+library(knitr)
+library(gridExtra)
+library(stargazer)
+library(dplyr)
+library(kableExtra)
+library(readxl)
+library(Metrics)
+library(MLmetrics)
+library(fastDummies)
+library(dummies)
+library(zoo)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(neuralnet)
+```
+
+<br/>
+
+## 2. Data 
+
+### 2.1 Dataset
+For this analysis we have daily transaction data for 1115 stores from Jan 2013 to April 2015. In this study, we will be using top 25 and bottom 25 stores to understand the impact of weekday, assortment, store type, promotions, competition distance and state holidays (public holidays, Christmas and Easter) on the sales.
+
+Table 1 shows a sample of the data. 
+
+
+```{r,echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+setwd("D:\\Github\\Rossman")
+
+
+# load the datasets
+full_data = read.csv("train.csv")
+store = read.csv("store.csv")
+
+store$CompetitionOpenSince <- as.yearmon(paste(store$CompetitionOpenSinceYear, 
+                                               store$CompetitionOpenSinceMonth, sep = "-"))
+
+# Convert the Promo2Since... variables to one Date variable
+# Assume that the promo starts on the first day of the week
+
+store$Promo2Since <- as.POSIXct(paste(store$Promo2SinceYear, 
+                                      store$Promo2SinceWeek, 1, sep = "-"),
+                                format = "%Y-%U-%u")
+
+#Imputing the missing values in Competition distance
+a = store %>% group_by(Assortment,StoreType) %>% summarise(med_comp_dist = median(CompetitionDistance,na.rm = T))
+store  = left_join(store,a)
+
+store$CompetitionDistance = ifelse(is.na(store$CompetitionDistance),store$med_comp_dist,store$CompetitionDistance)
+
+rm(a)
+
+#Combning daily sales and store level information
+merged_full_data = inner_join(full_data,store, by = "Store")
+
+#Creating new variables
+merged_full_data$id = 1:nrow(merged_full_data)
+
+
+merged_full_data$Date  = as.Date(merged_full_data$Date)
+merged_full_data = merged_full_data[order(merged_full_data$Date),]
+
+merged_full_data$Month = month(merged_full_data$Date)
+merged_full_data$Year =  year(merged_full_data$Date)
+merged_full_data$Day = mday(merged_full_data$Date)
+merged_full_data$WeekOfYear =  week(merged_full_data$Date)
+merged_full_data$DayOfWeek =  weekdays(merged_full_data$Date)
+merged_full_data$weekday = ifelse(merged_full_data$DayOfWeek %in% c("Saturday","Sunday"),0,1)
+
+
+#Splitting the data in training and test set
+train = merged_full_data[merged_full_data$Date <= as.Date("2015-04-30"),]
+test = merged_full_data[merged_full_data$Date > as.Date("2015-04-30"),]
+
+
+
+train = as.data.table(train)
+
+train_store  = train
+
+#Ranking the stores on the basis of sales
+stores_wise_sales = train %>% group_by(Store,Assortment,StoreType) %>% summarise(Revenue = round(mean(Sales)),count = n()) %>% arrange(-Revenue)
+stores_wise_sales$rank = 1:nrow(stores_wise_sales)
+
+#Sales having highest sales are considered in top 25
+top25 = stores_wise_sales %>% filter(rank %in% 1:25) 
+
+top25data = train %>% filter(Store %in% top25$Store) %>% mutate(Status = "Top")
+
+#Sales having lowest sales are considered in bottom 25
+bottom25 = stores_wise_sales %>% filter(rank %in% (nrow(stores_wise_sales)-24):nrow(stores_wise_sales)) 
+
+bottom25data = train %>% filter(Store %in% bottom25$Store) %>% mutate(Status = "Bottom")
+
+train_top_bottom = rbind(top25data,bottom25data)
+
+test_top25 = test %>% filter(Store %in% top25$Store)
+test_bottom25 = test %>% filter(Store %in% bottom25$Store)
+
+#Renaming the categorical variable values.
+top25data1 = top25data %>% mutate(weekday = ifelse(weekday == 1,"Yes","No"),Open = ifelse(Open == 1,"Yes","No"),
+                                  SchoolHoliday = ifelse(SchoolHoliday == 1,"Yes","No"),
+                                  Status = ifelse(Status == "Top","Top store","Laggard store"),
+                                  Promo = ifelse(Promo == 1,"Yes","No"),
+                                  Promo2 = ifelse(Promo2 == 1,"Yes","No"),
+                                  StateHoliday = ifelse(StateHoliday == "0","No holiday",ifelse(StateHoliday == "a","Public Holiday",ifelse(StateHoliday == "b","Easter","Christmas"))))
+
+#Renaming the variables
+top25data1 = top25data1 %>% select(Store,Status,Date,Day,'Week number' = WeekOfYear,Month,Year,'Is it a weekday' = weekday,Sales,'Number of customers' = Customers,'Is the store open' = Open,'Is there any promo?' = Promo,'Is there any second promo?' = Promo2, 'State Holiday' = StateHoliday,'Is it a school holiday' = SchoolHoliday,'Store Type' = StoreType,Assortment,'Competiton Distance (in meters)' = CompetitionDistance)
+
+#Renaming the categorical variable values.
+
+bottom25data1 = bottom25data %>% mutate(weekday = ifelse(weekday == 1,"Yes","No"),Open = ifelse(Open == 1,"Yes","No"),
+                                  SchoolHoliday = ifelse(SchoolHoliday == 1,"Yes","No"),
+                                  Status = ifelse(Status == "Top","Top store","Laggard store"),
+                                  Promo = ifelse(Promo == 1,"Yes","No"),
+                                  Promo2 = ifelse(Promo2 == 1,"Yes","No"),
+                                  StateHoliday = ifelse(StateHoliday == "0","No holiday",ifelse(StateHoliday == "a","Public Holiday",ifelse(StateHoliday == "b","Easter","Christmas"))))
+
+#Renaming the variables
+bottom25data1 = bottom25data1 %>% select(Store,Status,Date,Day,'Week number' = WeekOfYear,Month,Year,'Is it a weekday' = weekday,Sales,'Number of customers' = Customers,'Is the store open' = Open,'Is there any promo?' = Promo,'Is there any second promo?' = Promo2, 'State Holiday' = StateHoliday,'Is it a school holiday' = SchoolHoliday,'Store Type' = StoreType,Assortment,'Competiton Distance (in meters)' = CompetitionDistance)
+
+train_top_bottom1 = rbind(top25data1,bottom25data1)
+kable(head(top25data1), caption = "Table 1: Sample data for top 25 stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### 2.2 Descriptive Analysis
+
+From figure 1, it is evident that the sales and number of customers (when the store was open) in top 25 stores are extremely high as compared to laggard (bottom 25) stores
+
+**Figure 1**
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+par(mfrow = c(2,2),las = 0)
+hist(aggregate(top25data[Sales != 0]$Sales, 
+               by = list(top25data[Sales != 0]$Store), mean)$x, 
+     main = "Top stores - Average sales per store",
+     col = "skyblue",xlab = "Average sales",ylab ="",breaks = seq(10000,25000,1000))
+
+hist(aggregate(bottom25data[Sales != 0]$Sales, 
+               by = list(bottom25data[Sales != 0]$Store), mean)$x, 
+     main = "Laggard stores - Average sales per store",
+     col = "lightcyan1",xlab = "Average sales",ylab ="",breaks = seq(2000,4000,250))
+
+hist(aggregate(top25data[Sales != 0]$Customers, 
+               by = list(top25data[Sales != 0]$Store), mean)$x,10,
+     main = "Top stores - Average footfall per store", col = "skyblue",
+    xlab = "Average number of customers",ylab = "")
+
+hist(aggregate(bottom25data[Sales != 0]$Customers, 
+               by = list(bottom25data[Sales != 0]$Store), mean)$x,10,
+     main = "Laggard stores - Average footfall per store",
+     col = "lightcyan1",xlab = "Average number of customers",ylab = "")
+
+```
+
+**Promotions:** 
+
+There are 2 promotions running in a store: Promo 1 and Promo 2, 
+In figure 2, we have separate boxplots for top and bottom stores, depicting the sales when promo 1 was ongoing and not running. It can be seen that promo 1 has huge impact on all the stores, irrespective of their status. Moreover, the variation of sales during Promo 1 has reduced. Surprisingly, in figure 3 was witnessed that in the top stores, implementation of Promo 2 is leading to lower sales.
+
+
+**Figure 2**
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+z =ggplot(train_top_bottom1, aes(Sales)) + geom_boxplot(fill = "lightcyan1")
+
+z + facet_grid(`Is there any promo?`~Status,labeller = labeller(.rows = label_both)) + theme_classic()
+
+```
+
+
+**Figure 3**
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+z + facet_grid(`Is there any second promo?`~Status,labeller = labeller(.rows = label_both)) + theme_classic()
+```
+
+
+**Assortment:** 
+In figure 4, sales can be compared for various assortments for top and bottom stores. Bottom stores do not have assortment type 'b'. Furthermore, the sales for assortment 'a' and 'c' are not much different in worst performing stores, indicating that assortment does not impact their sales. While for top stores, sales are highly affected by the assortment.
+
+**Figure 4: Assortment wise sales for top and bottom stores**
+
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+z + facet_grid(Assortment~Status,labeller = labeller(.rows = label_both)) + theme_classic()
+```
+
+**Weekdays:** 
+For both best and worst performing stores, sales are more on weekends, but top performing stores see a higher shift in the sales as compared to laggard stores.
+
+**Figure 5 : Sales on weekdays and weekends for top and bottom stores**
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+
+#Weekday has a huge impact on sales of top 25 stores.
+z + facet_grid(`Is it a weekday`~Status,labeller = labeller(.rows = label_both)) + theme_classic()
+
+```
+
+
+Table 2 shows the relationship between total sales and total footfall for each day of the week and considering if a promo was running in the store. We experienced that irrespective of the status of the shop,  Sunday is the least preferred day for shopping by customers, while Saturdays as most preferred. Moreover, there are no promotions applied during Saturday and Sunday. If a promotion is ongoing then customers prefer to shop on Mondays.
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+#Getting  amount of sales by days and whether a promotion is ongoing
+promotion_and_days = train_top_bottom %>% group_by(DayOfWeek,Promo) %>%
+  summarise(Revenue = sum(Sales),Footfall = sum(Customers)) %>% arrange(-Footfall)
+promotion_and_days$Promo = ifelse(promotion_and_days$Promo == 0,"No","Yes")
+
+#Renaming the variables
+colnames(promotion_and_days)[1:2] = c("Day","Is a promotion ongoing?")
+
+kable(promotion_and_days, caption = "Table 2: Sales and footfall for the stores for each day of the week")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+Figure 6 shows that school holiday does not affect the sales in top and bottom stores. While state holidays do affect the revenue. 
+In bottom 25 stores, on public holidays sales are more or less consistent in all the 25 stores i.e., $ 5000  It was witnessed that the stores were open during  Easter and Christmas but the sales were 0, which seems an aberration.
+
+**Figure 6 : Sales on school holidays and state holidays for top and bottom stores**
+
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE,fig.fullwidth = T}
+
+par(mfrow = c(2,1),las = 0)
+
+
+boxplot(Sales~`Is it a school holiday`, data = top25data1[top25data1$Sales != 0 & top25data1$`Number of customers` != 0,],xlab  = "Was it a school holiday?",col = "skyblue" ,main = "Top stores")
+
+boxplot(Sales~`Is it a school holiday`, data = bottom25data1[bottom25data1$Sales != 0 & bottom25data1$`Number of customers` != 0,],
+        xlab  = "Was it a school holiday?",col = "lightcyan1",main = "Bottom stores")
+
+```
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE,fig.fullwidth = T}
+
+par(mfrow = c(2,1),las = 0)
+
+
+boxplot(Sales~`State Holiday`, data = top25data1[top25data1$Sales != 0 & top25data1$`Number of customers` != 0,],
+        xlab  = "Was it a state holiday?",col = "skyblue",main = "Top stores")
+
+boxplot(Sales~`State Holiday`, data = bottom25data1[bottom25data1$Sales != 0 & bottom25data1$`Number of customers` != 0,],
+        xlab  = "Was it a state holiday?",col = "lightcyan1",main = "Bottom stores")
+```
+
+
+
+Also, being self-evident, when the stores were closed then the sales were nil (table 3). There were only 3 days when the store were open although the sales were 0.
+
+
+```{r,echo = F}
+a = data.frame(table(ifelse(train_top_bottom$Open == 1, "Yes", "No"),
+      ifelse(train_top_bottom$Sales > 0, "More than 0", " 0")))
+colnames(a) = c("Was the store open?","Sales","Frequency")
+kable(a, caption = "Table 3: Number of occurences of non-zero sales")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+rm(a)
+```
+
+From table 4, we can see that on an average customers spend more in bottom stores, but it is the footfall which is leading to lower sales.
+
+```{r,echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+a = train_top_bottom %>% mutate(spend_per_cust = Sales/ Customers) %>% 
+  group_by(Status) %>% 
+  summarise(avg_sales = mean(Sales) ,
+              avg_customer_count = mean(Customers),
+            avg_spend_per_customer = mean(spend_per_cust,na.rm =T)) %>%   arrange(-avg_sales)
+a$avg_sales = round(a$avg_sales)
+a$avg_customer_count = round(a$avg_customer_count)
+a$avg_spend_per_customer = round(a$avg_spend_per_customer)
+kable(a, caption = "Table 4: Average customer count, sales and sales per customer for top and bottom stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+rm(a)
+```
+<br>
+**Competition distance:** 
+Figure 7 represent the average competition distance for the stores and their average sales. For most of the top stores we noticed that there are competitors within first 1 km but the sales are still high, while for bottom stores only a few of the stores have competitor within a range of 1km but they have low sales.
+
+**Figure 7 : Competition distance for stores and their sales**
+
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+#Competition distance is too much in bottom stores.
+salesByDist_top <- aggregate(top25data[Sales != 0 & !is.na(CompetitionDistance)]$Sales, 
+                         by = list(top25data[Sales != 0 & !is.na(CompetitionDistance)]$CompetitionDistance), mean)
+colnames(salesByDist_top) <- c("CompetitionDistance", "MeanSales")
+
+salesByDist_bottom <- aggregate(bottom25data[Sales != 0 & !is.na(CompetitionDistance)]$Sales, 
+                         by = list(bottom25data[Sales != 0 & !is.na(CompetitionDistance)]$CompetitionDistance), mean)
+colnames(salesByDist_bottom) <- c("CompetitionDistance", "MeanSales")
+
+c = ggplot(salesByDist_top[salesByDist_top$CompetitionDistance<= 1500,], aes(x = (CompetitionDistance), y = (MeanSales))) + 
+  geom_point(col = "navyblue") +labs(title = "Top stores", y = "Average sales", x="Competition distance (in meters)")
+
+
+d = ggplot(salesByDist_bottom[salesByDist_bottom$CompetitionDistance<= 1500,], aes(x = (CompetitionDistance), y = (MeanSales))) + 
+  geom_point(col = "navyblue")+labs(title = "Laggard stores", y = "Average sales", x="Competition distance (in meters)")
+grid.arrange(c,d, ncol = 2)
+
+```
+
+
+**Laggard stores are located in under-developed / rural areas**
+
+Since competition, assortment and promotion (promo 2) do not significantly impact the sales of these laggard stores, thus we can assume that these stores are located in rural / under - developed areas. If the geographical data were available then assessing for these stores would probably affirm our this assertion. Additionally, we noticed that although the stores are open during Easter and Christmas but the sales are 0 (Fig 6). This might be because people go to either urban areas to celebrate or they prefer buying from big supermarkets / malls because local stores might not be offering a variety.
+
+
+## 3. Assessing the impact of various factors on top and bottom stores.
+
+To understand how sales are the impacted by different promotions, assortment type, store type, holidays and weekdays, we have run  separate regression models for top 25 and bottom 25 stores separately.
+
+Since we know that when the stores are closed the sales are nil, hence, we are not using such cases to build our models. For such stores, if we know that the store will be closed in future then for those days we can simply forecast the sales as 0.
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE,results = "hide"}
+######## Training linear regression for top stores.
+
+
+#Filtering for rows where store is open
+train_open_top25 = top25data %>% filter(Open == 1)
+
+#Creating dummy variables.
+dummy_vars <- fastDummies::dummy_cols(train_open_top25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T)     
+
+train_open_top25 = cbind(train_open_top25,dummy_vars[,4:11])
+
+#Running a step-wise linear regression
+lm_top25 <- step(lm(Sales~., data = train_open_top25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                        "weekday" ,"Sales"  ,"Assortment_b"  ,           
+                                                        "Assortment_c","StoreType_b", "StoreType_c"   ,           
+                                                        "StoreType_d","StateHoliday_a","StateHoliday_b" ,          
+                                                        "StateHoliday_c")]),direction = "both",trace = 2)
+
+#Creating dummy variables for test set
+dummy_vars <- fastDummies::dummy_cols(test_top25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T)     
+colnames(dummy_vars)
+
+test_top25 = cbind(test_top25,dummy_vars[,4:9])
+test_top25$StateHoliday_b = 0
+test_top25$StateHoliday_c = 0
+
+#Predicting on test set
+predictions = predict(lm_top25,test_top25)
+
+
+test_top25$pred = predictions
+
+test_top25$pred = ifelse(test_top25$Open == 0,0,test_top25$pred)
+test_top25$pred = ifelse(test_top25$pred<0,0,test_top25$pred)
+
+#Calculating RMSE on top 25 stores for test set
+lm_rmse_top25 = RMSE(test_top25$pred[!is.na(test_top25$pred)],test_top25$Sales[!is.na(test_top25$pred)])
+
+
+test_top25$abs_error = abs(test_top25$pred -test_top25$Sales) / test_top25$Sales
+test_top25$abs_error = ifelse(is.na(test_top25$abs_error),0,test_top25$abs_error)
+
+test_top25_3 = test_top25 %>% filter(abs_error != Inf)
+
+#Calculating MAPE on top 25 stores for test set
+lm_mape_top25 = mean(test_top25_3$abs_error)*100
+
+
+
+######## Training linear regression for bottom stores.
+train_open_bottom25 = bottom25data %>% filter(Open == 1)
+
+#Creating dummy variables
+dummy_vars <- fastDummies::dummy_cols(train_open_bottom25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T)     
+
+
+train_open_bottom25 = cbind(train_open_bottom25,dummy_vars[,4:7])
+
+
+lm_bottom25 <- step(lm(Sales~., data = train_open_bottom25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                              "weekday" ,"Sales"  ,           
+                                                              "Assortment_c", "StoreType_c"   ,           
+                                                              "StoreType_d","StateHoliday_a")]),direction = "both",trace = 2)
+
+
+dummy_vars <- fastDummies::dummy_cols(test_bottom25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T) 
+test_bottom25 = cbind(test_bottom25,dummy_vars[,3:7])
+test_bottom25$StateHoliday_b = 0
+test_bottom25$StateHoliday_c = 0
+
+#Predicting sales for bottom stores (on test set)
+predictions = predict(lm_bottom25,test_bottom25)
+
+test_bottom25$pred = predictions
+
+test_bottom25$pred = ifelse(test_bottom25$Open == 0,0,test_bottom25$pred)
+test_bottom25$pred = ifelse(test_bottom25$pred<0,0,test_bottom25$pred)
+
+#Calculating RMSE on bottom 25 stores for test set
+
+lm_rmse_bottom25 = RMSE(test_bottom25$pred[!is.na(test_bottom25$pred)],test_bottom25$Sales[!is.na(test_bottom25$pred)])
+
+test_bottom25$abs_error = abs(test_bottom25$pred -test_bottom25$Sales) / test_bottom25$Sales
+test_bottom25$abs_error = ifelse(is.na(test_bottom25$abs_error),0,test_bottom25$abs_error)
+
+#Calculating MAPE on bottom 25 stores for test set
+
+lm_mape_bottom25 = mean(test_bottom25$abs_error)*100
+
+```
+
+
+
+
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+#Gathering coefficients and p-values
+a = data.frame(lm_top25$coefficients)
+b = data.frame(lm_bottom25$coefficients)
+c = data.frame(summary(lm_top25)$coefficients[,4])
+d = data.frame(summary(lm_bottom25)$coefficients[,4])
+
+a$coeff_desc  =rownames(a)
+b$coeff_desc = rownames(b)
+c$coeff_desc = rownames(c)
+colnames(c)[1] = "pvalues_top25"
+d$coeff_desc = rownames(d)
+colnames(d)[1] = "pvalues_bottom25"
+lm_coefficients  =full_join(a,b)
+
+lm_coefficients$lm_top25.coefficients = round(lm_coefficients$lm_top25.coefficients,1)
+lm_coefficients$lm_bottom25.coefficients = round(lm_coefficients$lm_bottom25.coefficients,1)
+
+lm_coefficients[is.na(lm_coefficients$lm_bottom25.coefficients),"lm_bottom25.coefficients"] = "-"
+lm_coefficients = full_join(lm_coefficients,c)
+lm_coefficients = full_join(lm_coefficients,d)
+lm_coefficients$pvalues_top25 = round(lm_coefficients$pvalues_top25,1)
+lm_coefficients$pvalues_bottom25 = round(lm_coefficients$pvalues_bottom25,1)
+lm_coefficients[is.na(lm_coefficients$pvalues_bottom25),"pvalues_bottom25"] = "-"
+
+lm_coefficients = lm_coefficients %>% select("Variable"  = coeff_desc,"Top 25 stores" = lm_top25.coefficients,
+                                             "Bottom 25 stores" = lm_bottom25.coefficients,
+                                             "pvalue (Top  25 stores)" =  pvalues_top25,"pvalue (Bottom  25 stores)" = pvalues_bottom25)
+lm_coefficients = lm_coefficients %>% mutate(Variable =ifelse(Variable == "(Intercept)","Intercept", ifelse(Variable == "StateHoliday_a" , "State Holiday (Public Holiday)",
+                                                               ifelse(Variable == "StateHoliday_b","Easter",
+                                   ifelse(Variable == "StateHoliday_c","Christmas",Variable)   )       )))
+kable(lm_coefficients, caption = "Table 5 : Coefficients for independent variables for top and bottom stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+
+```
+
+R square (or coefficient of determination) is used as a measure to understand how much variability in dependent variables (in our case sales) is explained by the explanatory (independent) variables. A high R square value is indicative of a good model.  **R square for linear regression model for top stores is 80.4% while for bottom stores is 66.4% indicating that model for top stores is capturing good amount of information to predict the sales which can be used for pricing strategies.**
+
+Table 5 presents the coefficients and pvalues for both the regression models. p-value for all of them is 0, indicating all of the variables are statistically significant. High difference in the intercept for top and bottom stores is a signal of extremely different sales in top and bottom stores.  
+<br>
+
+
+<br>
+
+*Customers and competition distance:* 
+
+For top stores an additional customer spends $5.5 and if the competition distance increased by 1 km the an additional revenure of about $47 can be generated. While in bottom stores spending by one customer generates $6.5 of revenue, but an increase in the competition distance by 1km is leading to only $16 of revenue generation. This it implies existence of a positive relationship between competitor distance and sales.
+<br>
+
+
+<br>
+
+*Promotion:*
+
+If promotion 1 is ongoing then it leads to additional sales of $ 2339 per day per store in top - selling stores as compared to $607 in bottom selling stores. Surprisingly, if promotion 2 is applied then it leads to reduction in sales by about $500 for top stores, because people might not be welcoming it . Since we have assumed that top stores belong to developed / urban areas where population is more and competition is high thus there are chances that people might be moving to some other stores which can be providing better offers / deals. In this case running promotion 2 in top stores won't be recommended. However, if promotion 2 is applied in laggard stores it leads to extra sales of  318 USD for each store on a daily level. 
+<br>
+
+
+<br>
+
+*Weekday:*
+
+A negative coefficient for weekday means generally, sales are higher on weekends (when weekday is 0). Thus a weekend is leading to additional sales of 751 USD in top stores and $96 in laggard store.
+<br>
+
+<br>
+
+
+*Assortment and store type:*
+  
+  For these models we have kept assortment 'a' as reference. In top stores, when assortment 'b' and 'c' are prevalent then sales are lower by approx $4000 and $700 as compared to assortment 'a'. In other words, for top selling stores assortment 'a' is leading to higher sales. Moreover, store type 'd' and 'c' is leading to an increase in sales by about $7600 and $1100 respectively, while store type 'b' leads to lower sales by by $3800 per store for each day.
+
+For laggard stores, only assortments 'a' and 'c' were present out of which assortment 'c' can lead to a drop in the sales by $440 per store. Laggard stores did not have store type 'b'. It was witnessed that both store types 'b' and 'd' are leading to additinal sales of around $300 each. Thus for these laggard stores we can think of opening stores of type 'c' and 'd'.
+<br>
+
+<br>
+
+
+*State holidays:*
+  
+  For top stores, State holidays are always leading to higher sales. During Christmas, sales increase by $3338 in every store while Easter and public holidays lead to additional sales of 1500 USD and around 1360 USD respectively.
+
+In bottom stores, we discovered in Fig 6 that although the stores are open during Easter and Christmas but customers are not coming. Thus their coefficient is 0. Moreover, on public holidays sales plummet by about $900. This might be because on public holidays people prefer going to more developed areas for shopping / excursion.
+
+
+## 4. Predicting Future Performance
+
+It is vital for an organisation to have an idea about future sales so that better decisions regarding promotions and inventory can be made on different holidays  / occasions.To forecast the sales for future we are comparing the accuracy by linear regression models and neural networks. For checking the accuracy of the model we have kept 3 months (10%) of our original data from May 2015 to July 2015.
+
+### 4.1 : Predictions by Linear Regression
+
+Tables 6 and 7 present a sample of forecasted values by multiple linear regression for top and laggard stores. Table for full predictions on test set is available in Table B in appendix.
+```{r, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+#Predicting on entire rtest set for top 25 stores
+a = test_top25[test_top25$Open == 1,c("Store","Date","Sales" ,"pred")]
+colnames(a)[colnames(a) == "pred"] = "Forecasted Sales"
+kable(head(a), caption = "Table 6 : Sample of forecasted sales by linear regression for top stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+
+#Predicting on entire rtest set for bottom 25 stores
+b = test_bottom25[test_bottom25$Open == 1,c("Store","Date","Sales" ,"pred")]
+colnames(b)[colnames(b) == "pred"] = "Forecasted Sales"
+kable(head(b), caption = "Table 7 : Sample of forecasted sales by linear regression for bottom stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+```
+
+
+### 4.2 : Predictions by Neural Networks
+
+
+We have created two neural networks with one hidden layer: one for top stores and bottom stores each. To get the best results we have tried experimenting by varying the number of neurons from 2 to 7. We have kept 3 months of data (Feb 2020 to Apr 2020) for validation of optimal number of neurons. Both the neural networks have optimal number of neurons as 6.
+
+
+```{r nn1, echo = F,cache=TRUE,message=FALSE, warning=FALSE,fig.fullwidth = T,results="hide"}
+
+#Training a neural network on bottom 25 stores.
+
+#Filtering the data when the store is open
+train_open_bottom25 = bottom25data %>% filter(Open == 1)
+
+maxs_bottom25 <- apply(train_open_bottom25[,c("Sales","Customers","CompetitionDistance")], 2, max) 
+mins_bottom25 <- apply(train_open_bottom25[,c("Sales","Customers","CompetitionDistance")], 2, min)
+
+#Scaling the dataset
+scaled_train_open_bottom25 = as.data.frame(scale(train_open_bottom25[,c("Sales","Customers","CompetitionDistance")], 
+                                                 center = mins_bottom25, scale = maxs_bottom25 - mins_bottom25))
+
+#Creating dummy variables
+dummy_vars <- fastDummies::dummy_cols(train_open_bottom25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T)     
+
+scaled_train_open_bottom25 = cbind(scaled_train_open_bottom25,dummy_vars[,4:7])
+
+scaled_train_open_bottom25 = cbind(scaled_train_open_bottom25,train_open_bottom25[,c("Date","Promo2","Promo","weekday","Assortment")])
+scaled_train1_open_bottom25 = scaled_train_open_bottom25 %>% filter(Date <= as.Date("2015-01-31"))
+
+scaled_valid_open_bottom25 = scaled_train_open_bottom25 %>% filter(Date > as.Date("2015-01-31"))
+
+#Creating a trainging set
+train1_open_bottom25 = train_open_bottom25 %>% filter(Date <= as.Date("2015-01-31"))
+
+#Creating a validation set
+valid_open_bottom25 = train_open_bottom25 %>% filter(Date > as.Date("2015-01-31"))
+
+l <- c()
+for (k in c(2,3,4,5,6,7)) {
+ 
+  # Create NN with k neurons
+  nn_bottom25 = neuralnet(formula = Sales~. ,data = scaled_train1_open_bottom25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                                                   "weekday" ,"Sales", "StoreType_c"   ,"StoreType_d","Assortment_c","StateHoliday_a")],
+                          hidden = k, threshold = 0.1 ,rep = 1,linear.output=TRUE,err.fct = 'sse')
+  
+  predictions_bottom25 <- compute(nn_bottom25,scaled_valid_open_bottom25)
+  predictions_bottom25_normalised <- predictions_bottom25$net.result*(maxs_bottom25["Sales"]-mins_bottom25["Sales"])+mins_bottom25["Sales"]
+  predictions_bottom25_normalised = ifelse(predictions_bottom25_normalised < 0, 0,predictions_bottom25_normalised)
+  
+  # Get actual sales 
+  actuals <- valid_open_bottom25$Sales
+  # Predict RMSE
+  rmse_bottom25 <- (sum((actuals - predictions_bottom25_normalised)^2)/length(actuals))^0.5
+  # Append to list
+  l<-c(l,rmse_bottom25)
+}
+
+#Training the neural network with optimal number of neurons on entire training set (including validation set)
+nn_bottom25 = neuralnet(formula = Sales~. ,data = scaled_train_open_bottom25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                                                "weekday" ,"Sales", "StoreType_c"   ,"StoreType_d","Assortment_c","StateHoliday_a")],
+                        hidden = (which.min(l)+1), threshold = 0.1 ,rep = 1,linear.output=TRUE,err.fct = 'sse')
+
+
+
+#Preparing the data for test set
+scaled_test_bottom25= as.data.frame(scale(test_bottom25[,c("Sales","Customers","CompetitionDistance")], center = mins_bottom25, 
+                                          scale = maxs_bottom25 - mins_bottom25))
+
+#Creating dumy variables
+dummy_vars <- fastDummies::dummy_cols(test_bottom25[,c("StoreType","StateHoliday","Assortment")],remove_first_dummy = T)     
+
+
+scaled_test_bottom25 = cbind(scaled_test_bottom25,dummy_vars[,4:7])
+scaled_test_bottom25$StateHoliday_b = 0
+scaled_test_bottom25$StateHoliday_c = 0
+
+scaled_test_bottom25 = cbind(scaled_test_bottom25,test_bottom25[,c("Promo2","Promo","weekday","Assortment")])
+
+#Predicting on bottom 25 test set (unnormalised)
+predictions_test_bottom25 <- compute(nn_bottom25,scaled_test_bottom25)
+
+#Predicting on bottom 25 test set (original scaled)
+
+test_bottom25$predictions_nn <- predictions_test_bottom25$net.result*(maxs_bottom25["Sales"]-mins_bottom25["Sales"])+mins_bottom25["Sales"]
+test_bottom25$predictions_nn = ifelse(test_bottom25$predictions_nn < 0, 0,test_bottom25$predictions_nn)
+test_bottom25$predictions_nn = ifelse(test_bottom25$Open == 0,0,test_bottom25$predictions_nn)
+
+#Calculating RMSE on test set
+nn_rmse_bottom25 <- (sum((test_bottom25$Sales - test_bottom25$predictions_nn)^2)/length(test_bottom25$Sales))^0.5
+
+#Calculating MAPE on test set
+test_bottom25$abs_error_nn = abs(test_bottom25$predictions_nn -test_bottom25$Sales) / test_bottom25$Sales
+test_bottom25$abs_error_nn = ifelse(is.na(test_bottom25$abs_error_nn),0,test_bottom25$abs_error_nn)
+
+nn_mape_bottom25 = mean(test_bottom25$abs_error_nn[test_bottom25$abs_error_nn != Inf])*100
+
+```
+
+```{r nn2, echo = F,cache=TRUE,message=FALSE, warning=FALSE,results = "hide"}
+#Training a neural network on bottom 25 stores.
+
+maxs_top25 <- apply(train_open_top25[,c("Sales","Customers","CompetitionDistance")], 2, max) 
+mins_top25 <- apply(train_open_top25[,c("Sales","Customers","CompetitionDistance")], 2, min)
+
+#Scaling the dataset
+scaled_train_open_top25 = as.data.frame(scale(train_open_top25[,c("Sales","Customers","CompetitionDistance")], 
+                                              center = mins_top25, scale = maxs_top25 - mins_top25))
+
+#Creating dummy variables
+dummy_vars <- fastDummies::dummy_cols(train_open_top25[,c("Assortment","StoreType","StateHoliday")],remove_first_dummy = T)     
+
+scaled_train_open_top25 = cbind(scaled_train_open_top25,dummy_vars[,4:11])
+
+scaled_train_open_top25 = cbind(scaled_train_open_top25,train_open_top25[,c("Date","Promo2","Promo","weekday","Assortment")])
+scaled_train1_open_top25 = scaled_train_open_top25 %>% filter(Date <= as.Date("2015-01-31"))
+
+scaled_valid_open_top25 = scaled_train_open_top25 %>% filter(Date > as.Date("2015-01-31"))
+
+#Creating data for training set
+train1_open_top25 = train_open_top25 %>% filter(Date <= as.Date("2015-01-31"))
+
+#Creating data for validation set
+valid_open_top25 = train_open_top25 %>% filter(Date > as.Date("2015-01-31"))
+
+
+l_top <- c()
+for (k in c(2,3,4,5,6,7)) {
+  
+  # Create NN with k neurons
+  nn_top25 = neuralnet(formula = Sales~. ,data = scaled_train1_open_top25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                                             "weekday" ,"Sales"  ,"StoreType_b", "StoreType_c"   ,"StoreType_d","Assortment_b","Assortment_c",
+                                                                             "StateHoliday_a","StateHoliday_b","StateHoliday_c")],
+                       hidden = k, threshold = 0.1 ,rep = 1,linear.output=TRUE,err.fct = 'sse')
+  
+  
+  
+  predictions_top25 <- compute(nn_top25,scaled_valid_open_top25)
+  predictions_top25_normalised <- predictions_top25$net.result*(maxs_top25["Sales"]-mins_top25["Sales"])+mins_top25["Sales"]
+  predictions_top25_normalised = ifelse(predictions_top25_normalised < 0, 0,predictions_top25_normalised)
+  
+  # Get actual sales 
+  actuals <- valid_open_top25$Sales
+  # Predict RMSE
+  rmse_top25 <- (sum((actuals - predictions_top25_normalised)^2)/length(actuals))^0.5
+  # Append to list
+  l_top<-c(l_top,rmse_top25)
+}
+
+
+#Building final neural network on training + validation set with optimal number of neurons
+nn_top25 = neuralnet(formula = Sales~. ,data = scaled_train_open_top25[,c("Customers","Promo","CompetitionDistance","Promo2",
+                                                                          "weekday" ,"Sales"  ,"StoreType_b", "StoreType_c"   ,"StoreType_d","Assortment_b","Assortment_c",
+                                                                          "StateHoliday_a","StateHoliday_b","StateHoliday_c")],
+                     hidden = (which.min(l_top)+1), threshold = 0.1 ,rep = 1,linear.output=TRUE,err.fct = 'sse')
+
+#preating data for prediction on test set
+
+scaled_test_top25= as.data.frame(scale(test_top25[,c("Sales","Customers","CompetitionDistance")], center = mins_top25, 
+                                       scale = maxs_top25 - mins_top25))
+
+#Creating dummy variables
+dummy_vars <- fastDummies::dummy_cols(test_top25[,c("StoreType","StateHoliday","Assortment")],remove_first_dummy = T)     
+
+
+scaled_test_top25 = cbind(scaled_test_top25,dummy_vars[,4:9])
+scaled_test_top25$StateHoliday_b = 0
+scaled_test_top25$StateHoliday_c = 0
+
+scaled_test_top25 = cbind(scaled_test_top25,test_top25[,c("Promo2","Promo","weekday","Assortment")])
+
+#Predicting on test set
+predictions_test_top25 <- compute(nn_top25,scaled_test_top25)
+
+#Re-scaling the predictions
+test_top25$predictions_nn <- predictions_test_top25$net.result*(maxs_top25["Sales"]-mins_top25["Sales"])+mins_top25["Sales"]
+test_top25$predictions_nn = ifelse(test_top25$predictions_nn < 0, 0,test_top25$predictions_nn)
+test_top25$predictions_nn = ifelse(test_top25$Open == 0,0,test_top25$predictions_nn)
+
+#Calculating RMSE
+nn_rmse_top25 <- (sum((test_top25$Sales - test_top25$predictions_nn)^2)/length(test_top25$Sales))^0.5
+
+#Calculating MAPE on test set
+test_top25$abs_error_nn = abs(test_top25$predictions_nn -test_top25$Sales) / test_top25$Sales
+test_top25$abs_error_nn = ifelse(is.na(test_top25$abs_error_nn),0,test_top25$abs_error_nn)
+
+nn_mape_top25 = mean(test_top25$abs_error_nn[test_top25$abs_error_nn != Inf])*100
+
+
+```
+
+Tables 8 and 9 present a sample of forecasted values by neural networks for top and laggard stores. Table for full predictions on test set is available in Table C in appendix.
+```{r nn_pred, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+c = test_top25[test_top25$Open == 1,c("Store","Date","Sales" ,"predictions_nn")]
+colnames(c)[colnames(c) == "predictions_nn"] = "Forecasted Sales"
+kable(head(c), caption = "Table 8 : Sample of forecasted sales by neural network for top stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+
+
+d = test_bottom25[test_bottom25$Open == 1,c("Store","Date","Sales" ,"predictions_nn")]
+colnames(d)[colnames(d) == "predictions_nn"] = "Forecasted Sales"
+kable(head(d), caption = "Table 9 : Sample of forecasted sales by neural network for bottom stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+
+```
+
+### 4.3 : Model comparisons
+
+
+To decide which model works best for forecasting sales in top stores and bottom stores we have used data from May 2015 to July 2015 for assessing the performance of linear regression and neural networks. We have used root mean square error( RMSE) and mean absolute percentage error (MAPE) as our accuracy metrics. Low RMSE and MAPE by neural networks (table 10 ) suggest that neural networks is able to capture a lot more information as compared to a linear regression model. This is more visible in case of top selling stores where RMSE dropped from about 1860 (linear regression) to 1220 (by using neural networks). Thus to predict the daily sales for top and bottom stores a neural network should be preferred over linear regression. Although if it comes to interpreting the coefficients then neural networks is a complete black box algorithm, thus the weights in a neural network won't be much intuitive. However, the coefficients in linear regression help us in understanding the impact of various factors on the sales.
+
+
+```{r accuracy_comparison, echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+#Comparing the accuracy metrics
+e = data.table(Status = c("Top selling store","Top selling store","Laggard store","Laggard store"),
+               Model = c("Linear Regression","Neural Networks","Linear Regression","Neural Networks"),
+               RMSE = c(lm_rmse_top25,nn_rmse_top25,lm_rmse_bottom25,nn_rmse_bottom25),
+               MAPE = c(lm_mape_top25,nn_mape_top25,nn_mape_bottom25,nn_mape_bottom25))
+e$RMSE = round(e$RMSE,1)
+e$MAPE = round(e$MAPE,1)
+colnames(e)[colnames(e) == "MAPE"] = "MAPE (in %)"
+
+kable(e, caption = "Table 10 : Accuracy comparison by various models for top and laggard stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+```
+
+
+## 5. Limitations:
+
+This analysis was meant for estimating the sales for each store at a daily level, considering store level characteristics and store level promotions, but sales of products largely depend upon the price of the products and competitor products, for which we had no information. Moreover, people hoard / stock pile the products when they are available for cheap - we were unable to capture this effect of pantry loading. Promotions on competitor products and SKUs can largely affect the sales of the products. 
+
+Furthermore, due to limited information, profitability was not taken into consideration. It is a possible that stores with highest sales might be less profitable due to competitiveness.
+Also, sales of a store are highly influenced by the advertisements. If such data can be made available then it can expand the scope of the analysis to a greater extent.
+
+We had assumed that bottom selling stores belong to under-developed / developing regions thus they are leading to lower sales and lower have lower footfall. Having spatial data for the same would assist in affirming this assertion.
+
+For this analysis we have tested only neural networks and linear regression, but it might happen more sophisticated methods like time series analysis can lead to better results and can elaborate the changes in sales due to trend and seasonality.
+
+## 6. Conclusion:
+
+In this study, through EDA and linear regression we discovered that promotion 2 is negatively affecting the top stores hence should not be applied for them. Since people prefer to shop more on weekends thus inventory should be properly planned during weekends to avoid stock outs. Moreover, assortment 'a' is generating more sales for top and laggard stores.
+
+Although being a black box algorithm, we discovered that neural networks is outperforming linear regression in forecasting the daily sales.
+
+
+
+## 7. Appendix:
+
+**Table A : RMSE of Neural networks on validation set for 2-7 neurons for top and bottom stores.**
+
+
+```{r , echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+f = data.frame(Neurons = 2:7,
+               RMSE_top_stores = l_top,
+               RMSE_bottom_stores = l)
+f$RMSE_top_stores = round(f$RMSE_top_stores)
+f$RMSE_bottom_stores = round(f$RMSE_bottom_stores)
+colnames(f) = c("Number of Neurons","RMSE (top stores)","RMSE (bottom stores)")
+
+kable(t(f), caption = "Table A : RMSE for top and laggard stores")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+```
+
+<br>
+<br>
+**Table B : Linear regression predictions.**
+
+```{r , echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+
+#Predicting on top 25 stores
+a = test_top25[test_top25$Open == 1,c("Store","Date","Sales" ,"pred")]
+colnames(a)[colnames(a) == "pred"] = "Forecasted Sales"
+a$Status  = "Top selling store"
+a  = a %>% select(Store,Status, everything())
+
+
+#Predicting on bottom 25 stores
+b = test_bottom25[test_bottom25$Open == 1,c("Store","Date","Sales" ,"pred")]
+colnames(b)[colnames(b) == "pred"] = "Forecasted Sales"
+b$Status = "Laggard store"
+b  = b %>% select(Store,Status, everything())
+c = rbind(a,b)
+rownames(c) = NULL
+kable(c, caption = "Table B : Predictions by linear regression")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+```
+
+
+
+<br>
+<br>
+**Table C : Neural networks predictions.**
+
+```{r , echo = F,cache=TRUE,message=FALSE, warning=FALSE}
+#Predicting on top 25 stores
+c = test_top25[test_top25$Open == 1,c("Store","Date","Sales" ,"predictions_nn")]
+colnames(c)[colnames(c) == "predictions_nn"] = "Forecasted Sales"
+c$Status  = "Top selling store"
+
+#Predicting on bottom 25 stores
+
+d = test_bottom25[test_bottom25$Open == 1,c("Store","Date","Sales" ,"predictions_nn")]
+colnames(d)[colnames(d) == "predictions_nn"] = "Forecasted Sales"
+d$Status  = "Laggard store"
+
+c  = c %>% select(Store,Status, everything())
+d  = d %>% select(Store,Status, everything())
+e = rbind(c,d)
+rownames(e) = NULL
+kable(e, caption = "Table C : Predictions by neural networks")%>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"))
+```
+
